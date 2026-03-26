@@ -72,7 +72,7 @@ class ClassroomFacialRecognitionService:
         return variance > dynamic_blur_thresh
 
     def _get_pose_penalty(self, face_landmarks):
-        """[แก้ไขที่ 2] รับ Landmarks ที่คำนวณแบบ Batch มาแล้ว ไม่ต้องคำนวณใหม่ทีละหน้า"""
+        """รับ Landmarks ที่คำนวณแบบ Batch มาแล้ว ไม่ต้องคำนวณใหม่ทีละหน้า"""
         if not face_landmarks: return 0.0
         
         lm = face_landmarks
