@@ -19,7 +19,6 @@ def put_thai_text(img, text, pos, color_bgr, font_size):
         except IOError:
             font = ImageFont.load_default()
     
-    # Convert image to PIL RGB, draw, then convert back to BGR
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img_pil = Image.fromarray(img_rgb)
     draw = ImageDraw.Draw(img_pil)
@@ -38,20 +37,17 @@ class ClassroomMonitoringSystem:
 
     def __init__(self, known_faces_path='known_faces'):
         self.path = known_faces_path
-        
-        # Blur thresholds
         self.BLUR_MIN_THRESH = 40.0
         self.BLUR_MAX_THRESH = 60.0
         self.BLUR_FACE_RATIO = 800.0
 
-        # Load YOLO for Counting
         print(f"[{datetime.now()}] INFO: Booting Counting Service (YOLOv8n)...")
-        self.yolo_model = YOLO("yolov8n.pt")  # Use Nano model for speed
+        self.yolo_model = YOLO("yolov8n.pt")  
         self.person_count = 0
+        self.last_yolo_boxes = []
         self.yolo_skip_frames = 10
         self.frame_counter = 0
 
-        # Load MediaPipe Tasks for Behavior (EAR + Head Pose)
         print(f"[{datetime.now()}] INFO: Booting Behavior Service (MediaPipe Tasks)...")
         model_path = 'face_landmarker.task'
         if not os.path.exists(model_path):
@@ -63,15 +59,16 @@ class ClassroomMonitoringSystem:
         options = mp.tasks.vision.FaceLandmarkerOptions(
             base_options=base_options,
             num_faces=10,
+            min_face_detection_confidence=0.6,
+            min_face_presence_confidence=0.6,
             output_facial_transformation_matrixes=True
         )
         self.face_landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
 
-        self.EAR_THRESH = 0.18  # ปรับให้ต่ำลง (ต้องหลับตาแน่นขึ้นถึงจะจับว่าหลับ)
+        self.EAR_THRESH = 0.18
         self.LEFT_EYE_IDXS = [33, 160, 158, 133, 153, 144]
         self.RIGHT_EYE_IDXS = [362, 385, 387, 263, 373, 380]
 
-        # Load Identity Database with OpenCV LBPH
         self.face_recognizer = cv2.face.LBPHFaceRecognizer_create()
         self.label_to_name = {}
         self.name_to_label = {}
@@ -79,10 +76,8 @@ class ClassroomMonitoringSystem:
         self._load_and_train_database()
 
     def _load_and_train_database(self):
-        print(f"[{datetime.now()}] INFO: Booting Identity Service (OpenCV LBPH)...")
         if not os.path.exists(self.path):
             os.makedirs(self.path)
-            print(f"[{datetime.now()}] WARN: Directory '{self.path}' created. Add images to '{self.path}'.")
             return
 
         faces = []
@@ -109,7 +104,7 @@ class ClassroomMonitoringSystem:
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_img)
                 mp_results = self.face_landmarker.detect(mp_image)
                 
-                if mp_results.face_landmarks:
+                if getattr(mp_results, 'face_landmarks', None):
                     face_landmarks = mp_results.face_landmarks[0]
                     img_h, img_w, _ = img.shape
                     x_coords = [lm.x * img_w for lm in face_landmarks]
@@ -125,16 +120,12 @@ class ClassroomMonitoringSystem:
                         face_crop = cv2.resize(face_crop, (200, 200))
                         faces.append(face_crop)
                         labels.append(label_id)
-                        print(f"  -> SUCCESS: Learned face from {filename}")
             except Exception as e:
-                print(f"[{datetime.now()}] ERROR: Failed to process {filename}: {e}")
+                pass
                 
         if len(faces) > 0:
             self.face_recognizer.train(faces, np.array(labels))
             self.is_lbph_trained = True
-            print(f"[{datetime.now()}] INFO: Ready! Loaded {len(faces)} face profiles.")
-        else:
-            print(f"[{datetime.now()}] WARN: No valid faces found in database to train LBPH.")
 
     def _check_blur_dynamic(self, rgb_image, top, right, bottom, left):
         face_width = right - left
@@ -176,82 +167,74 @@ class ClassroomMonitoringSystem:
         rmat, _ = cv2.Rodrigues(rotation_vector)
         angles, _, _, _, _, _ = cv2.RQDecomp3x3(rmat)
         
-        pitch = angles[0]
-        yaw = angles[1]
-        roll = angles[2]
-        
-        # Normalize OpenCV coordinate system flip (where looking straight could be 180 degrees)
+        pitch, yaw, roll = angles[0], angles[1], angles[2]
         if pitch > 90: pitch -= 180
         elif pitch < -90: pitch += 180
-        
         if yaw > 90: yaw -= 180
         elif yaw < -90: yaw += 180
-        
         return pitch, yaw, roll
 
-    def process_frame(self, frame, resize_scale=1):
+    def process_frame(self, frame, tracked_faces, current_time, resize_scale=1):
         self.frame_counter += 1
         img_h, img_w, _ = frame.shape
         
-        # 1. OPTIMIZATION: YOLO counting every 10 frames
         if self.frame_counter % self.yolo_skip_frames == 1 or self.frame_counter == 1:
             try:
-                results = self.yolo_model.predict(frame, classes=[0], verbose=False) # class 0 is person
-                self.person_count = len(results[0].boxes)
+                # conf=0.55 / iou=0.4 heavily restricts duplicate overlapping YOLO boxes
+                yolo_outs = self.yolo_model.predict(frame, classes=[0], conf=0.50, iou=0.45, verbose=False) 
+                if len(yolo_outs) > 0 and len(yolo_outs[0].boxes) > 0:
+                    self.last_yolo_boxes = yolo_outs[0].boxes.xyxy.cpu().numpy()
+                else:
+                    self.last_yolo_boxes = []
+                self.person_count = len(self.last_yolo_boxes)
             except Exception as e:
-                pass # YOLO error
+                pass
 
-        # 2. Behavior & Identity using MediaPipe
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
         mp_results = self.face_landmarker.detect(mp_image)
 
         detections = []
-        if getattr(mp_results, 'face_landmarks', None) is None or not mp_results.face_landmarks:
-            return detections, self.person_count
-
         face_locations = []
         behaviors = []
 
-        for face_landmarks in mp_results.face_landmarks:
-            x_coords = [lm.x * img_w for lm in face_landmarks]
-            y_coords = [lm.y * img_h for lm in face_landmarks]
-            left, top = int(min(x_coords)), int(min(y_coords))
-            right, bottom = int(max(x_coords)), int(max(y_coords))
-            
-            left = max(0, left)
-            top = max(0, top)
-            right = min(img_w - 1, right)
-            bottom = min(img_h - 1, bottom)
+        if getattr(mp_results, 'face_landmarks', None):
+            for face_landmarks in mp_results.face_landmarks:
+                x_coords = [lm.x * img_w for lm in face_landmarks]
+                y_coords = [lm.y * img_h for lm in face_landmarks]
+                left, top = int(min(x_coords)), int(min(y_coords))
+                right, bottom = int(max(x_coords)), int(max(y_coords))
+                
+                left = max(0, left)
+                top = max(0, top)
+                right = min(img_w - 1, right)
+                bottom = min(img_h - 1, bottom)
 
-            face_width = right - left
-            if face_width < 20 or top >= bottom or left >= right: 
-                continue
+                face_width = right - left
+                if face_width < 20 or top >= bottom or left >= right: 
+                    continue
 
-            face_locations.append((top, right, bottom, left))
+                face_locations.append((top, right, bottom, left))
 
-            left_eye_pts = [(face_landmarks[i].x * img_w, face_landmarks[i].y * img_h) for i in self.LEFT_EYE_IDXS]
-            right_eye_pts = [(face_landmarks[i].x * img_w, face_landmarks[i].y * img_h) for i in self.RIGHT_EYE_IDXS]
-            avg_ear = (calculate_ear(left_eye_pts) + calculate_ear(right_eye_pts)) / 2.0
-            
-            pitch, yaw, roll = self.estimate_head_pose(face_landmarks, img_w, img_h)
-            
-            eyes_closed = avg_ear < self.EAR_THRESH
-            head_bad_posture = abs(yaw) > 40 or pitch > 30 or pitch < -30 or abs(roll) > 30
-            state = "หลับ/เหม่อ" if (eyes_closed or head_bad_posture) else "ตั้งใจเรียน"
-            
-            # Using pose to heavily penalize recognition distance
-            pose_penalty = 15.0 if head_bad_posture else 0.0
-            
-            behaviors.append({
-                "bbox": {"Top": top, "Right": right, "Bottom": bottom, "Left": left},
-                "state": state,
-                "pose_penalty": pose_penalty,
-                "debug_text": f"EAR:{avg_ear:.2f} P:{pitch:.0f} Y:{yaw:.0f} R:{roll:.0f}"
-            })
+                left_eye_pts = [(face_landmarks[i].x * img_w, face_landmarks[i].y * img_h) for i in self.LEFT_EYE_IDXS]
+                right_eye_pts = [(face_landmarks[i].x * img_w, face_landmarks[i].y * img_h) for i in self.RIGHT_EYE_IDXS]
+                avg_ear = (calculate_ear(left_eye_pts) + calculate_ear(right_eye_pts)) / 2.0
+                
+                pitch, yaw, roll = self.estimate_head_pose(face_landmarks, img_w, img_h)
+                
+                eyes_closed = avg_ear < self.EAR_THRESH
+                head_bad_posture = abs(yaw) > 40 or pitch > 30 or pitch < -30 or abs(roll) > 30
+                state = "หลับ/เหม่อ" if (eyes_closed or head_bad_posture) else "ตั้งใจเรียน"
+                
+                pose_penalty = 15.0 if head_bad_posture else 0.0
+                
+                behaviors.append({
+                    "bbox": {"Top": top, "Right": right, "Bottom": bottom, "Left": left},
+                    "state": state,
+                    "pose_penalty": pose_penalty,
+                    "debug_text": f"EAR:{avg_ear:.2f} P:{pitch:.0f} Y:{yaw:.0f} R:{roll:.0f}"
+                })
 
-        # Process encodings for found faces using LBPH Fast Checker
-        if face_locations:
             for location, behavior in zip(face_locations, behaviors):
                 top, right, bottom, left = location
                 bbox = behavior["bbox"]
@@ -273,7 +256,6 @@ class ClassroomMonitoringSystem:
                     face_crop = cv2.resize(face_crop, (200, 200))
                     label_id, distance = self.face_recognizer.predict(face_crop)
                     
-                    # Typical LBPH threshold is 80 (lower distance = better match)
                     dynamic_threshold = 85.0 - behavior["pose_penalty"]
                     
                     if distance < dynamic_threshold:
@@ -290,28 +272,55 @@ class ClassroomMonitoringSystem:
                     "Name": name, "Confidence": round(conf, 2), "BoundingBox": bbox, "State": behavior["state"], "debug_text": behavior["debug_text"]
                 })
 
+        # --- Yolo Fallback Logic ---
+        for yb in self.last_yolo_boxes:
+            x1, y1, x2, y2 = map(int, yb[:4])
+            has_face = False
+            for loc in face_locations:
+                top, right, bottom, left = loc
+                if left <= x2 + 30 and right >= x1 - 30 and top <= y2 + 30 and bottom >= y1 - 30:
+                    has_face = True
+                    break
+            
+            if not has_face:
+                inherited_name = "ไม่พบใบหน้า"
+                for t_id, t_data in tracked_faces.items():
+                    tb = t_data["bbox"]
+                    # If Face Tracker is anywhere near this YOLO box, steal its identified name!
+                    if tb["Left"] <= x2 + 60 and tb["Right"] >= x1 - 60 and tb["Top"] <= y2 + 60 and tb["Bottom"] >= y1 - 60:
+                        if t_data["name"] not in ["คนแปลกหน้า", "ภาพเบลอ", "ไม่พบใบหน้า", "Unknown"]:
+                            inherited_name = t_data["name"]
+                            break
+                            
+                detections.append({
+                    "Name": inherited_name, 
+                    "Confidence": 0.0, 
+                    "BoundingBox": {"Top": y1, "Right": x2, "Bottom": y2, "Left": x1},
+                    "State": "ฟุบหลับ/หันหลัง",
+                    "debug_text": "YOLO Body Fallback"
+                })
+
         return detections, self.person_count
 
 if __name__ == "__main__":
     service = ClassroomMonitoringSystem()
     cap = cv2.VideoCapture(0)
     
-    # Tracking setup
     tracked_faces = {}
     next_track_id = 0
     confirmed_names_db = set()
     tracker_lock = threading.Lock()
 
-    CONFIRMATION_TIME = 5.0
-    TIMEOUT = 10.0
-    MAX_DISTANCE = 50
+    CONFIRMATION_TIME = 1.0
+    TIMEOUT = 1.0
+    MAX_DISTANCE = 100
 
     while True:
         ret, frame = cap.read()
         if not ret: break
         
         current_time = time.time()
-        results, person_count = service.process_frame(frame)
+        results, person_count = service.process_frame(frame, tracked_faces, current_time)
         
         with tracker_lock:
             keys_to_delete = [k for k, v in tracked_faces.items() if current_time - v["last_seen"] > TIMEOUT]
@@ -330,52 +339,53 @@ if __name__ == "__main__":
                 min_dist = MAX_DISTANCE
 
                 for t_id, t_data in tracked_faces.items():
-                    dist = math.hypot(cx - t_data["centroid"][0], cy - t_data["centroid"][1])
-                    if dist < min_dist:
-                        min_dist = dist
+                    dist_tracked = math.hypot(cx - t_data["centroid"][0], cy - t_data["centroid"][1])
+                    if dist_tracked < min_dist:
+                        min_dist = dist_tracked
                         best_match_id = t_id
 
-                is_tracking = False
-                is_confirmed = False
-                display_name = ai_name
-                elapsed_time = 0.0
-
                 if best_match_id is None:
-                    if ai_name not in ["คนแปลกหน้า", "ภาพเบลอ"]:
-                        tracked_faces[next_track_id] = {
-                            "name": ai_name, "centroid": (cx, cy),
-                            "first_seen": current_time, "last_seen": current_time,
-                            "confirmed": False, "state": state, "debug_text": res.get("debug_text", "")
-                        }
-                        display_name = ai_name
-                        is_tracking = True
-                        next_track_id += 1
+                    tracked_faces[next_track_id] = {
+                        "name": ai_name, "centroid": (cx, cy),
+                        "first_seen": current_time, "last_seen": current_time,
+                        "confirmed": False, "state": state, 
+                        "debug_text": res.get("debug_text", ""),
+                        "bbox": bb
+                    }
+                    next_track_id += 1
                 else:
                     t_data = tracked_faces[best_match_id]
                     t_data["centroid"] = (cx, cy)
                     t_data["last_seen"] = current_time
                     t_data["state"] = state
                     t_data["debug_text"] = res.get("debug_text", "")
-                    if not t_data["confirmed"] and ai_name not in ["คนแปลกหน้า", "ภาพเบลอ"]:
+                    t_data["bbox"] = bb
+                    if not t_data["confirmed"] and ai_name not in ["คนแปลกหน้า", "ภาพเบลอ", "ไม่พบใบหน้า"]:
                         t_data["name"] = ai_name
                     
                     elapsed_time = current_time - t_data["first_seen"]
                     if elapsed_time >= CONFIRMATION_TIME:
                         t_data["confirmed"] = True
-                        display_name = t_data["name"]
-                        is_confirmed = True
-                        is_tracking = True
-                    else:
-                        display_name = t_data["name"]
-                        is_tracking = True
 
-                if not is_tracking:
-                    if display_name == "ภาพเบลอ":
-                        color = (0, 165, 255)
-                        text = f"ภาพขยับ/เบลอ - {state}"
-                    else:
-                        color = (0, 0, 255)
-                        text = f"คนแปลกหน้า - {state}" 
+            for t_id, t_data in tracked_faces.items():
+                bb = t_data["bbox"]
+                state = t_data["state"]
+                display_name = t_data["name"]
+                elapsed_time = current_time - t_data["first_seen"]
+                is_confirmed = t_data["confirmed"]
+
+                if state == "ฟุบหลับ/หันหลัง":
+                    color = (0, 0, 255)
+                    text = f"{display_name} - {state}"
+                elif display_name == "ไม่พบใบหน้า":
+                    color = (0, 0, 255)
+                    text = f"ไม่พบใบหน้า - {state}"
+                elif display_name == "ภาพเบลอ":
+                    color = (0, 165, 255)
+                    text = f"ภาพขยับ/เบลอ - {state}"
+                elif display_name == "คนแปลกหน้า":
+                    color = (0, 0, 255)
+                    text = f"คนแปลกหน้า - {state}" 
                 else:
                     if is_confirmed:
                         color = (0, 255, 0) if state == "ตั้งใจเรียน" else (0, 165, 255)
@@ -391,14 +401,11 @@ if __name__ == "__main__":
                 cv2.rectangle(frame, (bb["Left"], bb["Top"]), (bb["Right"], bb["Bottom"]), color, 2)
                 frame = put_thai_text(frame, text, (bb["Left"], max(0, bb["Top"] - 30)), color, 24)
                 
-                # Draw debug text
-                debug_text = res.get("debug_text", "")
+                debug_text = t_data.get("debug_text", "")
                 if debug_text:
                     frame = put_thai_text(frame, debug_text, (bb["Left"], bb["Bottom"] + 5), (0, 255, 255), 18)
 
-        # Drawing YOLO Person Count
         frame = put_thai_text(frame, f"จำนวนคนในห้องทั้งหมด: {person_count} คน", (20, 20), (255, 255, 0), 32)
-
         cv2.imshow('Ultimate Classroom Identity + Behavior', frame)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
 
