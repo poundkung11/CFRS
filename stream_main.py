@@ -12,12 +12,12 @@ from datetime import datetime
 #  [INTEGRATOR CONFIG]  แก้ค่าตรงนี้ก่อน
 # ─────────────────────────────────────────
  
-USE_IP_WEBCAM   = True                         # True = มือถือ / False = webcam ในเครื่อง
+USE_IP_WEBCAM   = False                         # True = มือถือ / False = webcam ในเครื่อง
 IPWEBCAM_URL    = "http://192.168.1.105:8080"  # <-- เปลี่ยนเป็น IP จาก IP Webcam app
 CAMERA_INDEX    = 0                            # ใช้เมื่อ USE_IP_WEBCAM = False
  
 BACKEND_URL     = "http://127.0.0.1:5000/api/result"  # URL ของ Backend (แก้ตาม Backend จริง)
-BACKEND_ENABLED = True                         # False = ปิดการส่ง backend (debug mode)
+BACKEND_ENABLED = False                         # False = ปิดการส่ง backend (debug mode)
  
 FRAME_WIDTH     = 640                          # ความกว้างของภาพที่ประมวลผล
 FRAME_HEIGHT    = 480
