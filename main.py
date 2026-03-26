@@ -12,8 +12,6 @@ class ClassroomFacialRecognitionService:
     def __init__(self, known_faces_path='known_faces'):
         self.path = known_faces_path
         self.known_db = {}
-        
-        #Magic Numbers
         self.WEIGHT_BEST = 0.7
         self.WEIGHT_SECOND = 0.3
         self.CONFIDENCE_K = 12
@@ -193,10 +191,7 @@ if __name__ == "__main__":
 
         current_time = time.time()
         results = service.process_frame(frame)
-
-        # ใช้งาน Thread Lock เมื่อมีการเข้าถึงหรือเขียนทับตัวแปรแชร์ร่วม
         with tracker_lock:
-            # ล้าง Tracker ที่หลุดเฟรมไปเกิน TIMEOUT
             keys_to_delete = [k for k, v in tracked_faces.items() if current_time - v["last_seen"] > TIMEOUT]
             for k in keys_to_delete:
                 del tracked_faces[k]
@@ -239,8 +234,6 @@ if __name__ == "__main__":
                     t_data = tracked_faces[best_match_id]
                     t_data["centroid"] = (cx, cy)
                     t_data["last_seen"] = current_time
-                    
-                    # ถ้าชื่อยังไม่คอนเฟิร์ม แต่เฟรมนี้ระบบจำได้ชัดเจน ให้อัปเดตชื่อใน Tracker
                     if not t_data["confirmed"] and ai_name not in ["Unknown", "Moving/Blur"]:
                         t_data["name"] = ai_name
                     
@@ -253,8 +246,6 @@ if __name__ == "__main__":
                     else:
                         display_name = t_data["name"]
                         is_tracking = True
-
-                # Rendering
                 if not is_tracking:
                     if display_name == "Moving/Blur":
                         color = (0, 165, 255)
@@ -266,8 +257,6 @@ if __name__ == "__main__":
                     if is_confirmed:
                         color = (0, 255, 0)
                         text = f"{display_name} (Verified {conf}%)"
-                        
-                        # ตรวจสอบกับ confirmed_names_db 
                         if display_name not in confirmed_names_db:
                             print(f">>> [API/Database] เช็คชื่อ: {display_name} เวลา: {datetime.now()}")
                             confirmed_names_db.add(display_name)
