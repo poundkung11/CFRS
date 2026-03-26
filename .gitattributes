@@ -1,2 +1,44 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Python source files
+*.py text eol=lf diff=python
+
+# Jupyter notebooks (if any)
+*.ipynb text eol=lf diff=python
+
+# Config / data files
+*.txt text eol=lf
+*.md  text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.csv text eol=lf
+
+# Image files — binary, no diff
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.bmp  binary
+*.tiff binary
+*.webp binary
+
+# Model / numpy artifacts — binary
+*.npy  binary
+*.npz  binary
+*.pkl  binary
+*.h5   binary
+*.pt   binary
+*.pth  binary
+
+# Video files — binary
+*.mp4  binary
+*.avi  binary
+*.mov  binary
+*.mkv  binary
+
+# Linguist overrides
+known_faces/** linguist-documentation
+logs/**        linguist-generated
+data/**        linguist-generated
